@@ -1,0 +1,424 @@
+package main
+
+/*
+ *  Use cluster information to place new values in their appropriate cluster
+ *
+ *	Create three file types:
+ *		clustered_meta
+ *		clustered_index_[0-9]+
+ *		clustered_data_[0-9]+
+ *
+ *		clustered_meta holds information about the partitions
+ *		each clustered_data_i has the data that is closest to cluster i
+ *		each clustered_index_i has the original position of the data
+ *
+ *
+ *		Algorithm:
+ *			Read in data to rank
+ *			For each document set related to a single query:
+ *				1. For each document find it's cluster
+ *				2. Pair each document (0, 1, 2) -> ( (0,1) , (0,2) , (1,2))
+ *				3. For each pair we use the model releated to the cluster ids of each document
+ *				4. Create a map of these relationships [clusterID1,clusterID2] -> { (Doc_i,Doc_j), ... }
+ *				5. For each pair (clusterID1,clusterID2), where clusterID1 <= clusterID2:
+ *					a. 	Create a file containing the document pairs such that if there is a tulpe (Doc_i,Doc_j) then
+ *						Doc_j appears on the line directly following Doc_i
+ *					b.  Use the learned models to rank the document in this file
+ *					c.  Using the rankings of document pairs we can then construct the relationship between the documents
+ *						where 1 means Doc_i > Doc_j in terms of ranking
+ *				6.	Use the relationships found in step 5 to create a graph such that if the weight is 1 then we have an edge
+ *					going from the node representing Doc_i to the node representing Doc_j
+ *				7.  We then find the node with the largest out to in degree ratio and set it to have the highest ranking
+ *
+ *
+ *
+ *
+ *
+ *
+ */
+
+import (
+	"bytes"
+	"flag"
+	"fmt"
+	"os"
+	"os/exec"
+	"sync"
+
+	"github.com/deathly809/gomath"
+	"github.com/deathly809/research/ranking/src/go/util"
+)
+
+var (
+	methods = map[int]string{
+		1: "RANKNET",
+		2: "RANKBOOST",
+		3: "ADARANK",
+		6: "LAMBDA",
+	}
+)
+
+var (
+	pairwise  = flag.Bool("pairwise", false, "determines if we construct graph")
+	models    = flag.Int("models", -1, "how many models generated")
+	directory = flag.String("dir", "", "directory containing values")
+	data      = flag.String("data", "", "data to partition")
+	centroids = flag.String("centroids", "", "file with centroids")
+	ranker    = flag.Int("ranker", -1, "numberic ranker used")
+	eval      = flag.Bool("eval", false, "perform evaluations")
+	write     = flag.Bool("write", false, "write pairs to file")
+	exp       = flag.Bool("exp", false, "use experimental code")
+	merge     = flag.Bool("merged", false, "use experimental code")
+)
+
+var flags = []string{"centroids", "models", "dir", "data", "ranker"}
+
+func init() {
+	util.ValidateFlags(flags)
+}
+
+func handleExecError(err error, stdout, stderr *bytes.Buffer, model, input, output string) {
+	if err != nil {
+		fmtOut := fmt.Sprintf("error=%s\nmodel=%s\ninput=%s\noutput=%s\nProgram output\n\nStdout:\n%s\n\nStderr:\n%s\n\n", err.Error(), model, input, output, stdout.String(), stderr.String())
+		panic(fmtOut)
+	}
+}
+
+func evalulate(input, model, output string) {
+
+	cmd := exec.Command("java", "-jar", "./external/RankLib.jar", "-ranker", fmt.Sprintf("%d", *ranker), "-load", model, "-rank", input, "-score", output)
+	var out bytes.Buffer
+	var err bytes.Buffer
+	cmd.Stderr = &err
+	cmd.Stdout = &out
+
+	handleExecError(cmd.Run(), &out, &err, model, input, output)
+}
+
+func writeToFile(fName string, data *util.QueryDocumentSet, indices []mapping) {
+	buff := bytes.NewBuffer(nil)
+	for _, d := range indices {
+		buff.WriteString(data.GetDocument(d.from).String())
+		buff.WriteString("\n")
+		buff.WriteString(data.GetDocument(d.to).String())
+		buff.WriteString("\n")
+	}
+	writeBufferToFile(fName, buff)
+}
+
+type mapping struct {
+	from, to int
+	weight   float64
+}
+
+// given a set of documents create all possible pairs (within a query)
+//func createPairs(data []util.RankData, C [][]float64) map[int]map[int][]mapping {
+func createPairs(data *util.QueryDocumentSet, C [][]float64) map[int]map[int][]mapping {
+	// mappings[Cluster_I][Cluster_J] -> all pairs
+	mappings := make(map[int]map[int][]mapping)
+
+	//for i := range data {
+	for i := 0; i < data.Size(); i++ {
+		d1 := data.GetDocument(i)
+		cI := util.NearestElement(C, d1.Features(), util.Euclidean)
+		//for j := i + 1; j < len(data); j++ {
+		for j := i + 1; j < data.Size(); j++ {
+			d2 := data.GetDocument(j)
+			I, J := i, j
+			cJ := util.NearestElement(C, d2.Features(), util.Euclidean)
+
+			if cI > cJ {
+				cI, cJ = cJ, cI
+				I, J = J, I
+			}
+
+			if mappings[cI] == nil {
+				mappings[cI] = make(map[int][]mapping)
+			}
+
+			// append this to the set of pairs for Clusters I and J
+			mappings[cI][cJ] = append(mappings[cI][cJ], mapping{I, J, 0.0})
+		}
+	}
+	return mappings
+}
+
+type work struct {
+	k1, k2 int
+	v2     []mapping
+	data   *util.QueryDocumentSet
+}
+
+func runJob(jobs <-chan work, wg *sync.WaitGroup) {
+	for j := range jobs {
+		k1 := j.k1
+		k2 := j.k2
+		v2 := j.v2
+		data := j.data
+		tmpInput := createTempFile(fmt.Sprintf("in_%d_%d", k1, k2))
+		tmpOutput := createTempFile(fmt.Sprintf("out_%d_%d", k1, k2))
+
+		writeToFile(tmpInput, data, v2)
+		if k1 == k2 {
+			evalulate(tmpInput, fmt.Sprintf("%s/%s_%d", *directory, methods[*ranker], k1), tmpOutput)
+		} else {
+			if *merge {
+				evalulate(tmpInput, fmt.Sprintf("%s/%s_%d_%d", *directory, methods[*ranker], k1, k2), tmpOutput)
+			} else {
+				evalulate(tmpInput, fmt.Sprintf("%s/%s", *directory, methods[*ranker]), tmpOutput)
+			}
+		}
+
+		readFromFile(tmpOutput, v2)
+
+		os.Remove(tmpInput)
+		os.Remove(tmpOutput)
+
+	}
+
+	wg.Done()
+
+}
+
+// given a set of pairs we rank them.
+func evalulatePairs(mappings map[int]map[int][]mapping, data *util.QueryDocumentSet) {
+	const MaxJobs int = 10
+
+	wg := &sync.WaitGroup{}
+
+	jobs := make(chan work, MaxJobs)
+
+	for i := 0; i < MaxJobs; i++ {
+		wg.Add(1)
+		go runJob(jobs, wg)
+	}
+	for k1, v1 := range mappings {
+		for k2, v2 := range v1 {
+			jobs <- work{k1, k2, v2, data}
+		}
+	}
+
+	close(jobs)
+
+	wg.Wait()
+}
+
+type wrapper struct {
+	inDegree  float64
+	outDegree float64
+	ratio     float64
+	pos       int
+}
+
+// count the in and out degree of each vertex
+func countDegrees(s *sortable, dead []bool, mappings map[int]map[int][]mapping) {
+	for _, v1 := range mappings {
+		for _, v2 := range v1 {
+			for _, d := range v2 {
+				if !dead[d.from] && !dead[d.to] {
+					if d.weight > 0 {
+						s.nodeInfo[d.from].outDegree++
+						s.nodeInfo[d.to].inDegree++
+					} else {
+						s.nodeInfo[d.to].outDegree++
+						s.nodeInfo[d.from].inDegree++
+					}
+				}
+			}
+		}
+	}
+
+}
+
+func findBestRatio(s *sortable) (int, float64) {
+	bestIndex := -1
+	bestRatio := -1E100
+
+	for i, d := range s.nodeInfo {
+		ratio := d.outDegree / (1.0 + d.inDegree)
+		if ratio > bestRatio {
+			bestRatio = ratio
+			bestIndex = i
+		}
+	}
+	return bestIndex, bestRatio
+}
+
+// We use our graph to create our ranking
+func naive(mappings map[int]map[int][]mapping, data *util.QueryDocumentSet, iterations int) []float64 {
+	N := data.Size()
+
+	iterations = gomath.MinInt(iterations, N-1)
+
+	s := &sortable{}
+
+	s.n = N
+	s.nodeInfo = make([]wrapper, N)
+
+	dead := make([]bool, N)
+	res := make([]float64, N)
+
+	for iterations > 0 {
+
+		for i := 0; i < N; i++ {
+			s.nodeInfo[i].outDegree = 0
+			s.nodeInfo[i].inDegree = 0
+		}
+
+		countDegrees(s, dead, mappings)
+		bestIndex, bestRatio := findBestRatio(s)
+
+		dead[bestIndex] = true
+
+		res[bestIndex] = bestRatio
+
+		iterations--
+	}
+	return res
+}
+
+type sortable struct {
+	n        int
+	nodeInfo []wrapper
+	meta     [][]*wrapper
+}
+
+func (s sortable) Len() int { return s.n }
+func (s sortable) Swap(i, j int) {
+	s.nodeInfo[i], s.nodeInfo[j] = s.nodeInfo[j], s.nodeInfo[i]
+	s.meta[i], s.meta[j] = s.meta[j], s.meta[i]
+}
+
+func (s sortable) Less(i, j int) bool { return s.nodeInfo[i].ratio > s.nodeInfo[j].ratio }
+
+// We use our graph to create our ranking
+func createOrdering(mappings map[int]map[int][]mapping, data *util.QueryDocumentSet, iterations int) []float64 {
+	N := data.Size()
+	iterations = gomath.MinInt(iterations, N-1)
+
+	res := make([]float64, N)
+
+	active := make([]int, N)
+	inDegree := make([]int, N)
+	outDegree := make([][]int, N)
+
+	for i := range active {
+		active[i] = i
+	}
+
+	// O(N^3)
+	for _, v1 := range mappings {
+		for _, v2 := range v1 {
+			for _, d := range v2 {
+				if d.weight > 0 {
+					outDegree[d.from] = append(outDegree[d.from], d.to)
+					inDegree[d.to]++
+				} else {
+					outDegree[d.to] = append(outDegree[d.to], d.from)
+					inDegree[d.from]++
+				}
+			}
+		}
+	}
+
+	// O(N^2)
+	for len(active) > 0 {
+
+		aIndex := -1
+		best := -1.0
+		bestIdx := -1
+		for aI, i := range active {
+			test := float64(len(outDegree[i])) / (float64(inDegree[i]) + 1.0)
+			if test > best {
+				best = test
+				bestIdx = i
+				aIndex = aI
+			}
+		}
+
+		res[bestIdx] = best
+
+		for _, v := range outDegree[bestIdx] {
+			inDegree[v]--
+		}
+
+		active[aIndex] = active[len(active)-1]
+		active = active[:len(active)-1]
+	}
+
+	return res
+}
+
+// we evalulate pairs of documents to construct a graph which we
+// use to generate a ranking for documents
+func pairs(queries util.RankingData, C [][]float64) {
+	N := 0
+	for _, qid := range queries.QueryIds() {
+		//for _, v := range queries {
+		//N += len(v)
+		N += queries.QueryData(qid).Size()
+	}
+
+	display := make([]float64, N)
+
+	//for qid, data := range queries {
+	for _, qid := range queries.QueryIds() {
+		data := queries.QueryData(qid)
+		mappings := createPairs(data, C)
+		evalulatePairs(mappings, data)
+
+		if *write {
+			savePairs(fmt.Sprintf("pairs_%d", qid), mappings)
+		}
+
+		orderings := []float64(nil)
+		if *exp {
+			orderings = createOrdering(mappings, data, data.Size())
+		} else {
+			orderings = naive(mappings, data, data.Size())
+		}
+
+		for idx, val := range orderings {
+			display[data.GetDocument(idx).FilePosition()] = val
+		}
+	}
+
+	for _, d := range display {
+		fmt.Println(d)
+	}
+}
+
+// Rank each document one at a time
+func single(queries util.RankingData, C [][]float64) {
+	clusterIndices := make(map[int][][]int)
+	//for qid, data := range queries {
+	for _, qid := range queries.QueryIds() {
+		data := queries.QueryData(qid)
+		// for did, x := range data {
+		for did := 0; did < data.Size(); did++ {
+			x := data.GetDocument(did)
+			bIdx := util.NearestElement(C, x.Features(), util.Euclidean)
+			clusterIndices[bIdx] = append(clusterIndices[bIdx], []int{qid, did})
+		}
+	}
+
+	for i, indices := range clusterIndices {
+		iName := fmt.Sprintf("%s/clustered_data_%d", *directory, i)
+		dName := fmt.Sprintf("%s/clustered_index_%d", *directory, i)
+		writeClusterData(iName, dName, queries, indices)
+
+	}
+}
+
+// Convert to expected format
+func main() {
+
+	queries := util.LoadRankingData(*data)
+	C := util.LoadCentroids(*centroids)
+
+	if *pairwise {
+		pairs(queries, C)
+	} else {
+		single(queries, C)
+	}
+}

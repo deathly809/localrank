@@ -1,0 +1,56 @@
+\documentclass{article}
+
+\usepackage{fullpage}
+
+\begin{document}
+
+	\section{Methods}
+
+		I have three ideas I have tried.
+		In the first two I cluster on the data and then learn a function for each cluster.
+		Then I try to do a linear combination of those functions to get a good output.
+		In the final method I take the entire dataset and use a few known ranking algorithms to learn how to combine those.
+
+		\subsection{Method One}
+
+			In this method we perform logistic regression on each cluster and then learn how to combine the resulting models together.
+
+			\begin{itemize}
+				\item cluster data
+				\item for each cluster use logistic regression to learn how to rank 
+				\item Create a new data data using ranking functions to create a matrix of outputs.
+				\item Learn coefficients for each algorithms output (linear and non-linear combinations) 
+			\end{itemize}
+
+		\subsection{Method Two}
+
+			In this method we use a known learning to rank algorithm on each cluster and then learn how to combine the resulting models together.
+			\begin{itemize}
+				\item cluster data
+				\item for each cluster use a known Ranking algorithm
+				\item Create a new data data using ranking functions to create a matrix of outputs.
+				\item Learn coefficients for each algorithms output (linear and non-linear combinations) 
+			\end{itemize}
+
+		\subsection{Method Three}
+
+			In this method we perform learning to rank using multiple learners on the test data and then learn how to combine the models together. 
+
+			\begin{itemize}
+				\item For each ranking algorithm train on the entire data set
+				\item Create a new data data using the outputs of each ranking functions
+				\item Learn coefficients for each algorithms output (linear and non-linear combinations) 
+			\end{itemize}
+
+	\section{Combining}
+
+		For combining I have two ideas: use logistic regression to learn the coefficients, use a weighted sceheme that penalizes outputs which are wrong.
+		For our weighting scheme we apply the following algorithm
+		
+		\begin{itemize}
+			\item  Let $C = <c_1,...,c_m>$
+			\item  $c_j = \frac{1}{N} \sum_{i=1}^{N} \frac{x_{ij}}{({x_{ij}} - y_i)^2 + 0.00001}$
+			\item  Normalize $C$
+		\end{itemize}	
+
+\end{document}
